@@ -47,6 +47,47 @@ def fps(points: np.ndarray, npoint: int, seed: int = None) -> np.ndarray:
     return centroids
 
 
+def fps_torch(points: "torch.Tensor", npoint: int) -> "torch.Tensor":
+    """
+    Batched, vectorized PyTorch implementation of Farthest Point Sampling.
+    Compatible with torch.compile (avoids graph breaks from Python loop by keeping operations on-device).
+
+    Args:
+        points: [B, N, C] or [N, C] tensor (C >= 3, first 3 are xyz)
+        npoint: int, number of anchor points to select
+
+    Returns:
+        centroids: [B, npoint] or [npoint] int64 indices
+    """
+    import torch
+    is_unbatched = points.dim() == 2
+    if is_unbatched:
+        points = points.unsqueeze(0)
+    
+    B, N, _ = points.shape
+    xyz = points[..., :3].contiguous()
+    
+    device = xyz.device
+    centroids = torch.zeros((B, npoint), dtype=torch.long, device=device)
+    distance = torch.ones((B, N), dtype=torch.float32, device=device) * 1e10
+    
+    # Initialize with a random starting point
+    farthest = torch.randint(0, N, (B,), dtype=torch.long, device=device)
+    batch_indices = torch.arange(B, dtype=torch.long, device=device)
+    
+    for i in range(npoint):
+        centroids[:, i] = farthest
+        centroid = xyz[batch_indices, farthest, :].unsqueeze(1) # [B, 1, 3]
+        dist = torch.sum((xyz - centroid) ** 2, dim=-1) # [B, N]
+        distance = torch.min(distance, dist)
+        farthest = torch.max(distance, dim=-1)[1] # [B]
+        
+    if is_unbatched:
+        centroids = centroids.squeeze(0)
+        
+    return centroids
+
+
 def build_slices(points: np.ndarray, anchors: np.ndarray,
                  k: int = 64) -> np.ndarray:
     """

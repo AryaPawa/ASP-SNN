@@ -49,6 +49,39 @@ def compute_iou(pred: np.ndarray, target: np.ndarray, num_classes: int):
     return miou, macc, oa, {CLASS_NAMES[i]: ious[i] for i in range(num_classes)}
 
 
+def active_loss_seg(logits_final, logits_all, labels, criterion):
+    """
+    Computes final loss + auxiliary intermediate loss + confidence penalty.
+    labels: [B*N]
+    logits_final: [B*N, C]
+    logits_all: list of [B, N, C]
+    """
+    import torch.nn.functional as F
+    
+    loss = criterion(logits_final, labels)
+    
+    if len(logits_all) > 1:
+        # Auxiliary KD / hard-label CE loss
+        aux = sum(criterion(l.reshape(-1, l.shape[-1]), labels) for l in logits_all[:-1])
+        loss = loss + 0.1 * aux / (len(logits_all) - 1)
+        
+        # Confidence regularisation
+        conf_penalty = 0
+        S = len(logits_all)
+        for i, l in enumerate(logits_all):
+            w = (S - i) / S
+            probs = F.softmax(l.reshape(-1, l.shape[-1]), dim=-1)
+            max_p = probs.max(dim=-1).values
+            # Filter out ignore_index (-1)
+            valid = labels != -1
+            if valid.sum() > 0:
+                conf_penalty += w * (1.0 - max_p[valid]).mean()
+                
+        loss = loss + 0.05 * conf_penalty / S
+        
+    return loss
+
+
 def main():
     parser = base_argparser("ASP-SNN S3DIS Training")
     args = parser.parse_args()
@@ -177,15 +210,22 @@ def main():
             cat_ids = cat_ids.to(device, non_blocking=True)
 
             with autocast(device_type=device.type, enabled=cfg.use_amp):
-                logits, _ = model(
+                logits_final, logits_all = model(
                     slices, geo, sid_arr, cat_ids, pts_feat, training=True
                 )
-                # logits: [B, N, 13]
-                B, N, C = logits.shape
-                loss = criterion(
-                    logits.reshape(B * N, C),
+                # logits_final: [B, N, 13]
+                B, N, C = logits_final.shape
+                
+                loss = active_loss_seg(
+                    logits_final.reshape(B * N, C),
+                    logits_all,
                     sem_labels.reshape(B * N),
+                    criterion
                 )
+                
+                # Add spike firing-rate penalty if applicable
+                if hasattr(model, 'lif_head') and hasattr(model.lif_head, 'mean_firing_rate'):
+                    loss = loss + 0.01 * model.lif_head.mean_firing_rate()
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -228,10 +268,10 @@ def main():
                     sid_arr = sid_arr.to(device)
                     cat_ids = cat_ids.to(device)
 
-                    logits, _ = model(
+                    logits_final, _ = model(
                         slices, geo, sid_arr, cat_ids, pts_feat, training=False
                     )
-                    preds = logits.argmax(dim=-1)  # [B, N]
+                    preds = logits_final.argmax(dim=-1)  # [B, N]
                     all_preds.append(preds.cpu().numpy().reshape(-1))
                     all_true.append(sem_labels.numpy().reshape(-1))
 

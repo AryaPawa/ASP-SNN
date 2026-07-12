@@ -229,11 +229,19 @@ class ASPSegmentor(nn.Module):
         geo_ord          = geo[batch_idx, order]
         all_feats_sorted = all_feats[batch_idx, order]
 
-        # ASP loop — no early exit for segmentation
+        # Extract xyz from pts_features (always first 3 dims)
+        pts_xyz = pts_features[:, :, :3]
+        
+        # Per-point local features via direct lookup (original slice order)
+        b_idx       = torch.arange(B, device=device).unsqueeze(1).expand(B, N)
+        local_feats = all_feats[b_idx, sid_arr.long()]  # [B, N, feat_dim]
+
+        # ASP loop — compute intermediate logits for active loss
         states      = self.lif_head.init_state(B, device)
         belief      = torch.zeros(B, self.cfg.hidden_dim, device=device)
         vis_mask    = torch.zeros(B, M, dtype=torch.bool, device=device)
         belief_list = []
+        logits_all  = []
 
         for t in range(self.cfg.T):
             scores = self.ssp(belief, geo_ord, vis_mask)
@@ -255,20 +263,12 @@ class ASPSegmentor(nn.Module):
             _, states, u_last = self.lif_head.step(e_t, states)
             belief = self.belief_norm(u_last.detach())
             belief_list.append(belief)
+            
+            # Compute intermediate segmentation logits for this step
+            global_feat_t = torch.stack(belief_list, dim=0).mean(dim=0)
+            logits_t = self.seg_head(
+                local_feats, global_feat_t, point_feats, cat_onehot, pts_xyz,
+            )
+            logits_all.append(logits_t)
 
-        # Global feature = mean of all belief snapshots
-        global_feat = torch.stack(belief_list, dim=0).mean(dim=0)  # [B, hidden_dim]
-
-        # Per-point local features via direct lookup (original slice order)
-        b_idx       = torch.arange(B, device=device).unsqueeze(1).expand(B, N)
-        local_feats = all_feats[b_idx, sid_arr.long()]  # [B, N, feat_dim]
-
-        # Extract xyz from pts_features (always first 3 dims)
-        pts_xyz = pts_features[:, :, :3]
-
-        # Segmentation head
-        part_logits = self.seg_head(
-            local_feats, global_feat, point_feats, cat_onehot, pts_xyz,
-        )
-
-        return part_logits, belief_list
+        return logits_all[-1], logits_all
