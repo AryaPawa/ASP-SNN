@@ -5,6 +5,12 @@ Two main entry points:
     augment_slices()  — for classification (modifies slices only)
     augment_seg()     — for segmentation (shared transform on slices + pts)
 
+Augmentations added (novel contributions on top of baseline):
+    pointwolf_seg()   — simplified PointWOLF local non-linear distortion.
+                        Selects N_anchors random points, applies local
+                        anisotropic scaling to nearby points. Simulates
+                        real-world LiDAR scan non-linearities.
+
 All augmentations are numpy-based and applied in __getitem__.
 """
 
@@ -93,6 +99,65 @@ def augment_slices(slices: np.ndarray, cfg) -> np.ndarray:
     return result.astype(np.float32)
 
 
+def pointwolf_seg(slices: np.ndarray, pts_features: np.ndarray,
+                  cfg) -> tuple:
+    """
+    Simplified PointWOLF: Local non-linear distortion.
+
+    Selects num_anchors random anchor points and applies local anisotropic
+    scaling to all points within a radius of each anchor.
+    Applied consistently to both slices and per-point features.
+
+    Reference: Kim et al., PointWOLF (ECCV 2022).
+
+    Args:
+        slices:       [M, K, C]
+        pts_features: [N, F]  (first 3 dims are xyz)
+        cfg:          config with aug_pointwolf_* parameters
+
+    Returns:
+        (augmented_slices, augmented_pts_features)
+    """
+    if not getattr(cfg, 'aug_pointwolf', False):
+        return slices, pts_features
+
+    n_anchors  = getattr(cfg, 'aug_pointwolf_num_anchors', 3)
+    radius     = getattr(cfg, 'aug_pointwolf_radius', 0.3)
+    scale_lo   = getattr(cfg, 'aug_pointwolf_scale_lo', 0.7)
+    scale_hi   = getattr(cfg, 'aug_pointwolf_scale_hi', 1.3)
+
+    slices_out = slices.copy()
+    pts_out    = pts_features.copy()
+
+    # Sample anchors from per-point xyz (always first 3 dims of pts_features)
+    N = pts_features.shape[0]
+    anchor_idxs = np.random.choice(N, n_anchors, replace=False)
+    anchors = pts_features[anchor_idxs, :3]  # [n_anchors, 3]
+
+    for anchor in anchors:
+        scale = np.random.uniform(scale_lo, scale_hi, 3).astype(np.float32)
+
+        # Apply to pts_features xyz
+        delta_pts = pts_out[:, :3] - anchor  # [N, 3]
+        dist_pts  = np.linalg.norm(delta_pts, axis=1)  # [N]
+        mask_pts  = dist_pts < radius
+        if mask_pts.sum() > 0:
+            pts_out[mask_pts, :3] = anchor + delta_pts[mask_pts] * scale
+
+        # Apply same distortion to slices xyz (each slice is [K, C])
+        M, K, _ = slices_out.shape
+        for m in range(M):
+            delta_sl = slices_out[m, :, :3] - anchor  # [K, 3]
+            dist_sl  = np.linalg.norm(delta_sl, axis=1)  # [K]
+            mask_sl  = dist_sl < radius
+            if mask_sl.sum() > 0:
+                slices_out[m, mask_sl, :3] = (
+                    anchor + delta_sl[mask_sl] * scale
+                )
+
+    return slices_out.astype(np.float32), pts_out.astype(np.float32)
+
+
 def augment_seg(slices: np.ndarray, pts_features: np.ndarray,
                 cfg) -> tuple:
     """
@@ -164,11 +229,22 @@ def augment_seg(slices: np.ndarray, pts_features: np.ndarray,
             pts_aug[:, 3:6] = 0.0
             result[:, :, 3:6] = 0.0
 
-        # Color jitter
+        # Color jitter (additive)
         cjit = getattr(cfg, 'aug_color_jitter', 0.0)
         if cjit > 0:
             noise = np.random.uniform(-cjit, cjit, (1, 3)).astype(np.float32)
             pts_aug[:, 3:6] = np.clip(pts_aug[:, 3:6] + noise, 0.0, 1.0)
             result[:, :, 3:6] = np.clip(result[:, :, 3:6] + noise.reshape(1,1,3), 0.0, 1.0)
+
+        # Color brightness multiplicative jitter
+        cbright = getattr(cfg, 'aug_color_bright', 0.0)
+        if cbright > 0:
+            factor = np.random.uniform(1.0 - cbright, 1.0 + cbright, (1, 3)).astype(np.float32)
+            pts_aug[:, 3:6] = np.clip(pts_aug[:, 3:6] * factor, 0.0, 1.0)
+            result[:, :, 3:6] = np.clip(result[:, :, 3:6] * factor.reshape(1,1,3), 0.0, 1.0)
+
+    # PointWOLF local non-linear distortion (applied after rigid transforms)
+    if getattr(cfg, 'aug_pointwolf', False):
+        result, pts_aug = pointwolf_seg(result, pts_aug, cfg)
 
     return result.astype(np.float32), pts_aug.astype(np.float32)

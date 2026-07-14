@@ -195,6 +195,10 @@ def main():
         tau = max(cfg.tau_end, cfg.tau_start * (cfg.tau_decay ** epoch))
         model.gumbel_tau.fill_(tau)
 
+        # Reset LIF spike statistics for sparsity rate calculation
+        if hasattr(model, 'lif_head') and hasattr(model.lif_head, 'reset_spike_stats'):
+            model.lif_head.reset_spike_stats()
+
         # ── Train ─────────────────────────────────────────────────────
         model.train()
         total_loss = n_batches = 0

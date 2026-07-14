@@ -151,6 +151,7 @@ class ASPSegmentor(nn.Module):
             num_layers=cfg.num_lif_layers,
             leak=cfg.lif_leak,
             threshold=cfg.lif_threshold,
+            spike_dropout=getattr(cfg, 'spike_dropout', 0.0),
         )
 
         self.register_buffer('gumbel_tau',

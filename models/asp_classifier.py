@@ -73,6 +73,7 @@ class ASPClassifier(nn.Module):
             num_layers=cfg.num_lif_layers,
             leak=cfg.lif_leak,
             threshold=cfg.lif_threshold,
+            spike_dropout=getattr(cfg, 'spike_dropout', 0.0),
             cls_head_dims=cls_dims,
             cls_head_dropout=cls_drop,
         )
