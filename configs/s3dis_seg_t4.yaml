@@ -74,6 +74,10 @@ aug_cutmix_prob: 0.5
 # ── Neuromorphic Augmentation ──────────────────────────────────────────
 spike_dropout: 0.1          # 10% chance to drop spike per neuron timestep
 
+# ── Knowledge Distillation (KD) ────────────────────────────────────────
+kd_teacher_epochs: 30       # Set to 0 to disable teacher pre-training
+kd_temp: 4.0                # Temperature for soft target matching
+kd_lam: 0.5                 # KD loss weighting factor
 
 # ── Logging ────────────────────────────────────────────────────────────
 eval_interval: 5
@@ -81,3 +85,4 @@ log_dir: logs
 ckpt_dir: checkpoints
 seed: 42
 num_workers: 2           # Colab T4 has 2 CPUs — more workers causes slowdown
+
