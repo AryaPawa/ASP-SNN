@@ -12,6 +12,7 @@ test_area: 5
 block_size: 1.0
 use_rgb: true
 use_height: true
+epoch_len: 3000          # Limit training blocks per epoch (speeds up training 16x)
 input_channels: 7        # xyz(3) + rgb(3) + height(1)
 
 # ── Slicing ────────────────────────────────────────────────────────────
@@ -84,5 +85,4 @@ eval_interval: 5
 log_dir: logs
 ckpt_dir: checkpoints
 seed: 42
-num_workers: 2           # Colab T4 has 2 CPUs — more workers causes slowdown
-
+num_workers: 0           # Set to 0 to prevent PyTorch dataloader worker deadlocks on Kaggle/Colab

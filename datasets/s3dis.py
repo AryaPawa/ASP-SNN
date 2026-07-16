@@ -106,7 +106,11 @@ class S3DISDataset(Dataset):
         if split == 'train':
             # Each "sample" is one random block — we define epoch length
             # as total_points // n_points to see each point ~once per epoch
-            self._len = self.total_points // self.n_points
+            epoch_len = getattr(cfg, 'epoch_len', -1)
+            if epoch_len > 0:
+                self._len = epoch_len
+            else:
+                self._len = self.total_points // self.n_points
         else:
             # For testing: pre-compute all block centres for sliding window
             self.test_blocks = self._precompute_test_blocks()

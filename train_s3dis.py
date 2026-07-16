@@ -195,8 +195,11 @@ def main():
         t_sch = torch.optim.lr_scheduler.CosineAnnealingLR(t_opt, T_max=kd_teacher_epochs, eta_min=1e-5)
         t_criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=-1)
         for t_ep in range(kd_teacher_epochs):
+            t0_ep = time.time()
             t_loss_sum = t_n = 0
-            for slices_b, geo_b, pts_feat_b, sid_b, sem_labels_b, cat_b in train_loader:
+            n_t_batches = len(train_loader)
+            log_every_t = max(1, n_t_batches // 10) # 10 progress prints per epoch
+            for batch_idx_t, (slices_b, geo_b, pts_feat_b, sid_b, sem_labels_b, cat_b) in enumerate(train_loader):
                 pts_feat_b  = pts_feat_b.to(device, non_blocking=True)
                 sem_labels_b = sem_labels_b.to(device, non_blocking=True)
                 t_logits = kd_teacher(pts_feat_b)  # [B, N, 13]
@@ -207,9 +210,17 @@ def main():
                 t_opt.step()
                 t_loss_sum += float(t_loss.detach()) * B
                 t_n        += B
+
+                # Batch level progress logs
+                if (batch_idx_t + 1) % log_every_t == 0 or (batch_idx_t + 1) == n_t_batches:
+                    elapsed_t = time.time() - t0_ep
+                    print(
+                        f"  [Teacher] ep{t_ep+1} [{batch_idx_t+1:4d}/{n_t_batches}] "
+                        f"loss={t_loss.item():.4f} elapsed={elapsed_t:.0f}s",
+                        flush=True,
+                    )
             t_sch.step()
-            if (t_ep + 1) % 10 == 0:
-                print(f"  [Teacher] Ep {t_ep+1:2d}/{kd_teacher_epochs}  loss={t_loss_sum/t_n:.4f}")
+            print(f"  [Teacher] Ep {t_ep+1:2d}/{kd_teacher_epochs}  total_loss={t_loss_sum/t_n:.4f} time={time.time()-t0_ep:.0f}s", flush=True)
         kd_teacher.eval()
         teacher_ckpt = os.path.join(cfg.ckpt_dir, "s3dis_teacher.pth")
         torch.save(kd_teacher.state_dict(), teacher_ckpt)
