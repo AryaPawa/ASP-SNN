@@ -50,14 +50,15 @@ tau_decay: 0.95
 
 # ── Augmentation ───────────────────────────────────────────────────────
 aug_rotate_z: true
-aug_scale_lo: 0.9
-aug_scale_hi: 1.1
+aug_scale_lo: 0.8
+aug_scale_hi: 1.25
 aug_translate: 0.1
 aug_jitter_sigma: 0.005
 aug_jitter_clip: 0.02
 aug_color_drop: 0.2
 aug_color_jitter: 0.05
 aug_color_bright: 0.1       # Brightness jitter multiplier
+aug_global_point_dropout: 0.1  # Randomly drop up to 10% points per block
 aug_elastic: false
 
 # ── Simplified PointWOLF Augmentation ─────────────────────────────────

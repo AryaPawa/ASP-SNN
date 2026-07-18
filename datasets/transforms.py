@@ -243,6 +243,21 @@ def augment_seg(slices: np.ndarray, pts_features: np.ndarray,
             pts_aug[:, 3:6] = np.clip(pts_aug[:, 3:6] * factor, 0.0, 1.0)
             result[:, :, 3:6] = np.clip(result[:, :, 3:6] * factor.reshape(1,1,3), 0.0, 1.0)
 
+    # Global point dropout (simulate sparse LiDAR scans)
+    # Randomly zero-out a fraction of points in the block (slices + pts)
+    gpdrop = getattr(cfg, 'aug_global_point_dropout', 0.0)
+    if gpdrop > 0 and np.random.random() < 0.5:  # apply with 50% probability
+        ratio = np.random.uniform(0, gpdrop)
+        # Drop from pts_aug
+        drop_mask = np.random.random(N) < ratio
+        if drop_mask.sum() > 0:
+            pts_aug[drop_mask] = pts_aug[0]  # replace with first point
+        # Drop from slices
+        for m in range(M):
+            sl_drop = np.random.random(K) < ratio
+            if sl_drop.sum() > 0:
+                result[m, sl_drop] = result[m, 0]
+
     # PointWOLF local non-linear distortion (applied after rigid transforms)
     if getattr(cfg, 'aug_pointwolf', False):
         result, pts_aug = pointwolf_seg(result, pts_aug, cfg)

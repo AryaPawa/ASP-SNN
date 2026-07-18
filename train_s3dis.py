@@ -22,6 +22,70 @@ from datasets.s3dis import S3DISDataset, CLASS_NAMES, NUM_CLASSES, compute_class
 from models.asp_segmentor import ASPSegmentor
 
 
+def plot_training_curves(log_path: str, out_dir: str):
+    """
+    Read the CSV training log and plot mIoU, loss, and LR curves.
+    Saved as s3dis_training_curves.png in out_dir.
+    Works across resume runs since all epochs append to the same CSV.
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')  # non-interactive backend — works on Kaggle/Colab
+        import matplotlib.pyplot as plt
+        import csv
+
+        epochs, losses, mious, maccs, lrs = [], [], [], [], []
+        with open(log_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('miou', '') == '':
+                    continue  # skip non-eval epochs
+                epochs.append(int(row['epoch']))
+                losses.append(float(row['train_loss']))
+                mious.append(float(row['miou']))
+                maccs.append(float(row['macc']))
+                lrs.append(float(row['lr']))
+
+        if not epochs:
+            print("[Plot] No eval epochs found in log yet.")
+            return
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        fig.suptitle('S3DIS ASP-SNN Training Curves', fontsize=14, fontweight='bold')
+
+        axes[0].plot(epochs, mious, 'b-o', markersize=3, label='mIoU')
+        axes[0].plot(epochs, maccs, 'g--s', markersize=3, label='mAcc')
+        axes[0].set_title('Segmentation Metrics')
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('%')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        if mious:
+            best_ep = epochs[mious.index(max(mious))]
+            axes[0].axvline(best_ep, color='r', linestyle=':', alpha=0.7, label=f'Best ep{best_ep}')
+            axes[0].legend()
+
+        axes[1].plot(epochs, losses, 'r-o', markersize=3)
+        axes[1].set_title('Training Loss')
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Loss')
+        axes[1].grid(True, alpha=0.3)
+
+        axes[2].semilogy(epochs, lrs, 'm-o', markersize=3)
+        axes[2].set_title('Learning Rate')
+        axes[2].set_xlabel('Epoch')
+        axes[2].set_ylabel('LR (log scale)')
+        axes[2].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        out_path = os.path.join(out_dir, 's3dis_training_curves.png')
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"[Plot] Training curves saved → {out_path}")
+    except Exception as e:
+        print(f"[Plot] Warning: could not generate plot ({e})")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  KD teacher (PointNet-style per-point segmentation)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,11 +342,14 @@ def main():
         best_miou = ckpt.get('best_metric', 0.0)
         print(f"Resumed from epoch {start_epoch}, best mIoU: {best_miou*100:.2f}%")
 
-    # ── Logging ───────────────────────────────────────────────────────
+    # ── Logging — use ONE shared log across all resume runs ───────────
+    # s3dis_train_log.csv accumulates across runs; timestamped runs get their own file too
+    shared_log_path = os.path.join(cfg.log_dir, 's3dis_train_log.csv')
     run_name = f"s3dis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    log_path = os.path.join(cfg.log_dir, f"{run_name}.csv")
-    with open(log_path, 'w') as f:
-        f.write("epoch,train_loss,miou,macc,oa,lr,time\n")
+    log_path = shared_log_path  # always append to the shared log
+    if not os.path.exists(log_path):
+        with open(log_path, 'w') as f:
+            f.write("epoch,train_loss,miou,macc,oa,lr,time\n")
 
     # ── Training loop ─────────────────────────────────────────────────
     for epoch in range(start_epoch, cfg.epochs):
@@ -440,6 +507,9 @@ def main():
 
     print(f"\nDone. Best mIoU: {best_miou*100:.2f}%")
     print(f"Checkpoint: {cfg.ckpt_dir}/s3dis_best.pt")
+
+    # Plot training curves from shared log
+    plot_training_curves(log_path, cfg.log_dir)
 
 
 if __name__ == "__main__":
