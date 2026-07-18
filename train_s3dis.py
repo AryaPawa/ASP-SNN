@@ -187,44 +187,56 @@ def main():
     kd_temp = float(getattr(cfg, 'kd_temp', 4.0))
     kd_lam  = float(getattr(cfg, 'kd_lam', 0.5))
     kd_teacher = None
-    if kd_teacher_epochs > 0:
-        print(f"\n[KD] Pre-training PointNet seg teacher ({kd_teacher_epochs} ep, T={kd_temp}, λ={kd_lam})")
-        kd_teacher = PointNetSegTeacher(NUM_CLASSES, in_channels=in_ch).to(device)
-        kd_teacher.train()
-        t_opt = torch.optim.AdamW(kd_teacher.parameters(), lr=1e-3, weight_decay=1e-4)
-        t_sch = torch.optim.lr_scheduler.CosineAnnealingLR(t_opt, T_max=kd_teacher_epochs, eta_min=1e-5)
-        t_criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=-1)
-        for t_ep in range(kd_teacher_epochs):
-            t0_ep = time.time()
-            t_loss_sum = t_n = 0
-            n_t_batches = len(train_loader)
-            log_every_t = max(1, n_t_batches // 10) # 10 progress prints per epoch
-            for batch_idx_t, (slices_b, geo_b, pts_feat_b, sid_b, sem_labels_b, cat_b) in enumerate(train_loader):
-                pts_feat_b  = pts_feat_b.to(device, non_blocking=True)
-                sem_labels_b = sem_labels_b.to(device, non_blocking=True)
-                t_logits = kd_teacher(pts_feat_b)  # [B, N, 13]
-                B, N, C = t_logits.shape
-                t_loss = t_criterion(t_logits.reshape(B*N, C), sem_labels_b.reshape(B*N))
-                t_opt.zero_grad(); t_loss.backward()
-                nn.utils.clip_grad_norm_(kd_teacher.parameters(), 1.0)
-                t_opt.step()
-                t_loss_sum += float(t_loss.detach()) * B
-                t_n        += B
+    teacher_ckpt = os.path.join(cfg.ckpt_dir, "s3dis_teacher.pth")
 
-                # Batch level progress logs
-                if (batch_idx_t + 1) % log_every_t == 0 or (batch_idx_t + 1) == n_t_batches:
-                    elapsed_t = time.time() - t0_ep
-                    print(
-                        f"  [Teacher] ep{t_ep+1} [{batch_idx_t+1:4d}/{n_t_batches}] "
-                        f"loss={t_loss.item():.4f} elapsed={elapsed_t:.0f}s",
-                        flush=True,
-                    )
-            t_sch.step()
-            print(f"  [Teacher] Ep {t_ep+1:2d}/{kd_teacher_epochs}  total_loss={t_loss_sum/t_n:.4f} time={time.time()-t0_ep:.0f}s", flush=True)
+    if kd_teacher_epochs > 0:
+        kd_teacher = PointNetSegTeacher(NUM_CLASSES, in_channels=in_ch).to(device)
+
+        # If a saved teacher already exists (e.g. resuming after Kaggle timeout),
+        # skip re-training and just load it — saves ~2 hours per resume run.
+        if os.path.exists(teacher_ckpt):
+            print(f"\n[KD] Found saved teacher checkpoint → loading from {teacher_ckpt}")
+            kd_teacher.load_state_dict(
+                torch.load(teacher_ckpt, map_location=device, weights_only=False)
+            )
+            print("[KD] Teacher loaded successfully. Skipping pre-training.")
+        else:
+            print(f"\n[KD] Pre-training PointNet seg teacher ({kd_teacher_epochs} ep, T={kd_temp}, λ={kd_lam})")
+            kd_teacher.train()
+            t_opt = torch.optim.AdamW(kd_teacher.parameters(), lr=1e-3, weight_decay=1e-4)
+            t_sch = torch.optim.lr_scheduler.CosineAnnealingLR(t_opt, T_max=kd_teacher_epochs, eta_min=1e-5)
+            t_criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=-1)
+            for t_ep in range(kd_teacher_epochs):
+                t0_ep = time.time()
+                t_loss_sum = t_n = 0
+                n_t_batches = len(train_loader)
+                log_every_t = max(1, n_t_batches // 10)
+                for batch_idx_t, (slices_b, geo_b, pts_feat_b, sid_b, sem_labels_b, cat_b) in enumerate(train_loader):
+                    pts_feat_b   = pts_feat_b.to(device, non_blocking=True)
+                    sem_labels_b = sem_labels_b.to(device, non_blocking=True)
+                    t_logits = kd_teacher(pts_feat_b)
+                    B, N, C = t_logits.shape
+                    t_loss = t_criterion(t_logits.reshape(B*N, C), sem_labels_b.reshape(B*N))
+                    t_opt.zero_grad(); t_loss.backward()
+                    nn.utils.clip_grad_norm_(kd_teacher.parameters(), 1.0)
+                    t_opt.step()
+                    t_loss_sum += float(t_loss.detach()) * B
+                    t_n        += B
+
+                    if (batch_idx_t + 1) % log_every_t == 0 or (batch_idx_t + 1) == n_t_batches:
+                        elapsed_t = time.time() - t0_ep
+                        print(
+                            f"  [Teacher] ep{t_ep+1} [{batch_idx_t+1:4d}/{n_t_batches}] "
+                            f"loss={t_loss.item():.4f} elapsed={elapsed_t:.0f}s",
+                            flush=True,
+                        )
+                t_sch.step()
+                print(f"  [Teacher] Ep {t_ep+1:2d}/{kd_teacher_epochs}  total_loss={t_loss_sum/t_n:.4f} time={time.time()-t0_ep:.0f}s", flush=True)
+            torch.save(kd_teacher.state_dict(), teacher_ckpt)
+            print(f"[KD] Teacher saved → {teacher_ckpt}")
+
         kd_teacher.eval()
-        teacher_ckpt = os.path.join(cfg.ckpt_dir, "s3dis_teacher.pth")
-        torch.save(kd_teacher.state_dict(), teacher_ckpt)
-        print(f"[KD] Teacher saved → {teacher_ckpt}")
+
 
     model = ASPSegmentor(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
