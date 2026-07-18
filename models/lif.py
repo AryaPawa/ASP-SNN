@@ -87,35 +87,44 @@ class LIFCell(nn.Module):
 
     def __init__(self, in_dim: int, out_dim: int,
                  leak: float = 0.9, threshold: float = 1.0,
-                 spike_dropout: float = 0.0):
+                 spike_dropout: float = 0.0,
+                 lif_learnable: bool = True):
         super().__init__()
-        self.out_dim       = out_dim
-        self.spike_dropout = spike_dropout
+        self.out_dim        = out_dim
+        self.spike_dropout  = spike_dropout
+        self.lif_learnable  = lif_learnable
         self.fc = nn.Linear(in_dim, out_dim, bias=False)
         self.bn = nn.BatchNorm1d(out_dim)
 
-        # Learnable per-neuron leak: sigmoid(log_leak) ∈ (0, 1)
-        init_log_leak = math.log(leak / (1.0 - leak + 1e-6))
-        self.log_leak = nn.Parameter(
-            torch.full((out_dim,), init_log_leak)
-        )
-
-        # Learnable per-neuron threshold: softplus(raw_thr) > 0
-        # softplus_inv(x) = log(exp(x) - 1)
-        init_raw_thr = math.log(math.exp(threshold) - 1.0 + 1e-6)
-        self.raw_threshold = nn.Parameter(
-            torch.full((out_dim,), init_raw_thr)
-        )
+        if lif_learnable:
+            # Learnable per-neuron leak: sigmoid(log_leak) ∈ (0, 1)
+            init_log_leak = math.log(leak / (1.0 - leak + 1e-6))
+            self.log_leak = nn.Parameter(
+                torch.full((out_dim,), init_log_leak)
+            )
+            # Learnable per-neuron threshold: softplus(raw_thr) > 0
+            init_raw_thr = math.log(math.exp(threshold) - 1.0 + 1e-6)
+            self.raw_threshold = nn.Parameter(
+                torch.full((out_dim,), init_raw_thr)
+            )
+        else:
+            # Fixed LIF — constants, not trained (ablation baseline)
+            self.register_buffer('_fixed_leak',      torch.tensor(leak))
+            self.register_buffer('_fixed_threshold', torch.tensor(threshold))
 
     @property
     def eff_leak(self) -> torch.Tensor:
         """Effective leak ∈ (0, 1) for current batch device."""
-        return torch.sigmoid(self.log_leak)
+        if self.lif_learnable:
+            return torch.sigmoid(self.log_leak)
+        return self._fixed_leak
 
     @property
     def eff_threshold(self) -> torch.Tensor:
         """Effective threshold > 0 for current batch device."""
-        return F.softplus(self.raw_threshold)
+        if self.lif_learnable:
+            return F.softplus(self.raw_threshold)
+        return self._fixed_threshold
 
     def step(self, x: torch.Tensor, u_prev: torch.Tensor,
              s_prev: torch.Tensor):
@@ -184,6 +193,7 @@ class MultiLayerLIF(nn.Module):
                  num_layers: int = 3, leak: float = 0.9,
                  threshold: float = 1.0,
                  spike_dropout: float = 0.0,
+                 lif_learnable: bool = True,
                  cls_head_dims: list = None,
                  cls_head_dropout: list = None):
         self._spike_sum   = 0.0
@@ -198,7 +208,8 @@ class MultiLayerLIF(nn.Module):
         dims_in = [feat_dim] + [hidden_dim] * (num_layers - 1)
         self.cells = nn.ModuleList([
             LIFCell(d_in, hidden_dim, leak, threshold,
-                    spike_dropout=spike_dropout)
+                    spike_dropout=spike_dropout,
+                    lif_learnable=lif_learnable)
             for d_in in dims_in
         ])
 

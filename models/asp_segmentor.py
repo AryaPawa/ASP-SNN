@@ -152,6 +152,7 @@ class ASPSegmentor(nn.Module):
             leak=cfg.lif_leak,
             threshold=cfg.lif_threshold,
             spike_dropout=getattr(cfg, 'spike_dropout', 0.0),
+            lif_learnable=getattr(cfg, 'lif_learnable', True),  # default True = learnable LIF
         )
 
         self.register_buffer('gumbel_tau',
