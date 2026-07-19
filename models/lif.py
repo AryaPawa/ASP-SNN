@@ -14,12 +14,23 @@ Surrogate gradient — ATan:
     Used by SPM (our reference backbone) and all modern SNN papers.
     g(x) = alpha / (2 * (1 + (alpha * pi * x / 2)^2)), alpha=2.0
 
+Learnable LIF (Novel contribution):
+    leak and threshold are per-neuron nn.Parameters, constrained via
+    sigmoid (leak ∈ (0,1)) and softplus (threshold > 0). This allows
+    the network to learn optimal membrane dynamics per-neuron.
+
+Neuromorphic Augmentation — Temporal Spike Dropout:
+    During training, spikes are randomly zeroed with probability
+    spike_dropout. This simulates neuromorphic sensor event dropout
+    and acts as a regulariser specific to spiking networks.
+
 AMP safety: Custom autograd forward/backward are decorated with
     @custom_fwd(cast_inputs=torch.float32) / @custom_bwd to prevent
     fp16 overflow in the pow(2) term when AMP is enabled.
 """
 
 import math
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -65,22 +76,70 @@ def _spike(x: torch.Tensor) -> torch.Tensor:
 
 
 class LIFCell(nn.Module):
-    """Single LIF neuron layer with soft reset."""
+    """
+    Single LIF neuron layer with soft reset and learnable dynamics.
+
+    leak      : per-neuron, learned via sigmoid so it stays in (0, 1)
+    threshold : per-neuron, learned via softplus so it stays > 0
+    spike_dropout: neuromorphic augmentation — randomly zeros spikes
+                   during training to simulate sensor event loss
+    """
 
     def __init__(self, in_dim: int, out_dim: int,
-                 leak: float = 0.9, threshold: float = 1.0):
+                 leak: float = 0.9, threshold: float = 1.0,
+                 spike_dropout: float = 0.0,
+                 lif_learnable: bool = True):
         super().__init__()
-        self.leak      = leak
-        self.threshold = threshold
-        self.out_dim   = out_dim
+        self.out_dim        = out_dim
+        self.spike_dropout  = spike_dropout
+        self.lif_learnable  = lif_learnable
         self.fc = nn.Linear(in_dim, out_dim, bias=False)
         self.bn = nn.BatchNorm1d(out_dim)
 
-    def step(self, x, u_prev, s_prev):
+        if lif_learnable:
+            # Learnable per-neuron leak: sigmoid(log_leak) ∈ (0, 1)
+            init_log_leak = math.log(leak / (1.0 - leak + 1e-6))
+            self.log_leak = nn.Parameter(
+                torch.full((out_dim,), init_log_leak)
+            )
+            # Learnable per-neuron threshold: softplus(raw_thr) > 0
+            init_raw_thr = math.log(math.exp(threshold) - 1.0 + 1e-6)
+            self.raw_threshold = nn.Parameter(
+                torch.full((out_dim,), init_raw_thr)
+            )
+        else:
+            # Fixed LIF — constants, not trained (ablation baseline)
+            self.register_buffer('_fixed_leak',      torch.tensor(leak))
+            self.register_buffer('_fixed_threshold', torch.tensor(threshold))
+
+    @property
+    def eff_leak(self) -> torch.Tensor:
+        """Effective leak ∈ (0, 1) for current batch device."""
+        if self.lif_learnable:
+            return torch.sigmoid(self.log_leak)
+        return self._fixed_leak
+
+    @property
+    def eff_threshold(self) -> torch.Tensor:
+        """Effective threshold > 0 for current batch device."""
+        if self.lif_learnable:
+            return F.softplus(self.raw_threshold)
+        return self._fixed_threshold
+
+    def step(self, x: torch.Tensor, u_prev: torch.Tensor,
+             s_prev: torch.Tensor):
         """One timestep: x [B, in_dim] -> (u_new, s_new) each [B, out_dim]."""
         inp = F.relu(self.bn(self.fc(x)))
-        u_t = self.leak * u_prev + inp - self.threshold * s_prev
-        s_t = _spike(u_t - self.threshold)
+        leak = self.eff_leak          # [out_dim]
+        thr  = self.eff_threshold     # [out_dim]
+        u_t  = leak * u_prev + inp - thr * s_prev
+        s_t  = _spike(u_t - thr)
+
+        # Neuromorphic Augmentation: Temporal Spike Dropout
+        if self.training and self.spike_dropout > 0.0:
+            keep = (torch.rand_like(s_t) >= self.spike_dropout).float()
+            s_t  = s_t * keep
+
         return u_t, s_t
 
 
@@ -122,25 +181,35 @@ class SpikeRateLogger:
 
 class MultiLayerLIF(nn.Module):
     """
-    3-layer LIF head with residual connections.
+    3-layer LIF head with residual connections and learnable dynamics.
 
     Input:  e_t [B, feat_dim]  (fused slice feature per ASP step)
     Output: logits [B, num_classes], new_states, u_last [B, hidden_dim]
+
+    spike_dropout: neuromorphic augmentation probability passed to each LIFCell.
     """
 
     def __init__(self, feat_dim: int, hidden_dim: int, num_classes: int,
                  num_layers: int = 3, leak: float = 0.9,
                  threshold: float = 1.0,
+                 spike_dropout: float = 0.0,
+                 lif_learnable: bool = True,
                  cls_head_dims: list = None,
                  cls_head_dropout: list = None):
+        self._spike_sum   = 0.0
+        self._spike_total = 0
         super().__init__()
-        self.num_layers = num_layers
-        self.hidden_dim = hidden_dim
+        self.num_layers   = num_layers
+        self.hidden_dim   = hidden_dim
         self.spike_monitor = None
+        self._spike_sum   = 0.0
+        self._spike_total = 0
 
         dims_in = [feat_dim] + [hidden_dim] * (num_layers - 1)
         self.cells = nn.ModuleList([
-            LIFCell(d_in, hidden_dim, leak, threshold)
+            LIFCell(d_in, hidden_dim, leak, threshold,
+                    spike_dropout=spike_dropout,
+                    lif_learnable=lif_learnable)
             for d_in in dims_in
         ])
 
@@ -191,6 +260,10 @@ class MultiLayerLIF(nn.Module):
             u_new, s_new = cell.step(x, u, s)
             new_states.append((u_new, s_new))
 
+            # Track firing rate for energy efficiency reporting
+            self._spike_sum   += s_new.sum().item()
+            self._spike_total += s_new.numel()
+
             if self.spike_monitor is not None:
                 self.spike_monitor.record(i, s_new)
 
@@ -202,3 +275,17 @@ class MultiLayerLIF(nn.Module):
         logits = self.fc_out(x)
         u_last = new_states[-1][0]
         return logits, new_states, u_last
+
+    def mean_firing_rate(self) -> float:
+        """
+        Returns mean spike firing rate accumulated since last reset.
+        Called by train_s3dis.py to compute the sparsity regularisation loss.
+        """
+        if self._spike_total == 0:
+            return 0.0
+        return self._spike_sum / self._spike_total
+
+    def reset_spike_stats(self):
+        """Reset counters at the start of each epoch."""
+        self._spike_sum   = 0.0
+        self._spike_total = 0

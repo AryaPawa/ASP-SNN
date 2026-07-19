@@ -22,6 +22,110 @@ from datasets.s3dis import S3DISDataset, CLASS_NAMES, NUM_CLASSES, compute_class
 from models.asp_segmentor import ASPSegmentor
 
 
+def plot_training_curves(log_path: str, out_dir: str):
+    """
+    Read the CSV training log and plot mIoU, loss, and LR curves.
+    Saved as s3dis_training_curves.png in out_dir.
+    Works across resume runs since all epochs append to the same CSV.
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')  # non-interactive backend — works on Kaggle/Colab
+        import matplotlib.pyplot as plt
+        import csv
+
+        epochs, losses, mious, maccs, lrs = [], [], [], [], []
+        with open(log_path, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('miou', '') == '':
+                    continue  # skip non-eval epochs
+                epochs.append(int(row['epoch']))
+                losses.append(float(row['train_loss']))
+                mious.append(float(row['miou']))
+                maccs.append(float(row['macc']))
+                lrs.append(float(row['lr']))
+
+        if not epochs:
+            print("[Plot] No eval epochs found in log yet.")
+            return
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        fig.suptitle('S3DIS ASP-SNN Training Curves', fontsize=14, fontweight='bold')
+
+        axes[0].plot(epochs, mious, 'b-o', markersize=3, label='mIoU')
+        axes[0].plot(epochs, maccs, 'g--s', markersize=3, label='mAcc')
+        axes[0].set_title('Segmentation Metrics')
+        axes[0].set_xlabel('Epoch')
+        axes[0].set_ylabel('%')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+        if mious:
+            best_ep = epochs[mious.index(max(mious))]
+            axes[0].axvline(best_ep, color='r', linestyle=':', alpha=0.7, label=f'Best ep{best_ep}')
+            axes[0].legend()
+
+        axes[1].plot(epochs, losses, 'r-o', markersize=3)
+        axes[1].set_title('Training Loss')
+        axes[1].set_xlabel('Epoch')
+        axes[1].set_ylabel('Loss')
+        axes[1].grid(True, alpha=0.3)
+
+        axes[2].semilogy(epochs, lrs, 'm-o', markersize=3)
+        axes[2].set_title('Learning Rate')
+        axes[2].set_xlabel('Epoch')
+        axes[2].set_ylabel('LR (log scale)')
+        axes[2].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        out_path = os.path.join(out_dir, 's3dis_training_curves.png')
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"[Plot] Training curves saved → {out_path}")
+    except Exception as e:
+        print(f"[Plot] Warning: could not generate plot ({e})")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  KD teacher (PointNet-style per-point segmentation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PointNetSegTeacher(nn.Module):
+    """Lightweight PointNet segmentation teacher for knowledge distillation."""
+    def __init__(self, num_classes: int, in_channels: int = 7):
+        super().__init__()
+        self.local_mlp = nn.Sequential(
+            nn.Conv1d(in_channels, 64, 1), nn.BatchNorm1d(64), nn.ReLU(),
+            nn.Conv1d(64, 128, 1), nn.BatchNorm1d(128), nn.ReLU(),
+        )
+        self.global_mlp = nn.Sequential(
+            nn.Conv1d(128, 1024, 1), nn.BatchNorm1d(1024), nn.ReLU(),
+        )
+        self.seg_head = nn.Sequential(
+            nn.Conv1d(1024 + 128, 512, 1), nn.BatchNorm1d(512), nn.ReLU(),
+            nn.Conv1d(512, 256, 1), nn.BatchNorm1d(256), nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Conv1d(256, num_classes, 1),
+        )
+
+    def forward(self, pts_feat):  # [B, N, C]
+        x = pts_feat.permute(0, 2, 1)   # [B, C, N]
+        local_feat = self.local_mlp(x)  # [B, 128, N]
+        global_feat = self.global_mlp(local_feat).max(dim=-1, keepdim=True).values  # [B, 1024, 1]
+        global_feat = global_feat.expand(-1, -1, local_feat.size(-1))  # [B, 1024, N]
+        combined = torch.cat([local_feat, global_feat], dim=1)  # [B, 1152, N]
+        return self.seg_head(combined).permute(0, 2, 1)  # [B, N, num_classes]
+
+
+def seg_kd_loss(student_logits, teacher_logits, T: float = 4.0) -> torch.Tensor:
+    """Per-point KL divergence loss for segmentation KD."""
+    B, N, C = student_logits.shape
+    s = F.log_softmax(student_logits.reshape(B * N, C) / T, dim=-1)
+    t = F.softmax(teacher_logits.detach().reshape(B * N, C) / T, dim=-1)
+    return F.kl_div(s, t, reduction="batchmean") * (T * T)
+
+
+
 def compute_iou(pred: np.ndarray, target: np.ndarray, num_classes: int):
     """Compute per-class IoU, mIoU, OA, and mAcc."""
     ious = []
@@ -47,6 +151,39 @@ def compute_iou(pred: np.ndarray, target: np.ndarray, num_classes: int):
     macc = float(np.nanmean(acc_arr))
     oa = float((pred == target).sum() / max(len(target), 1))
     return miou, macc, oa, {CLASS_NAMES[i]: ious[i] for i in range(num_classes)}
+
+
+def active_loss_seg(logits_final, logits_all, labels, criterion):
+    """
+    Computes final loss + auxiliary intermediate loss + confidence penalty.
+    labels: [B*N]
+    logits_final: [B*N, C]
+    logits_all: list of [B, N, C]
+    """
+    import torch.nn.functional as F
+    
+    loss = criterion(logits_final, labels)
+    
+    if len(logits_all) > 1:
+        # Auxiliary KD / hard-label CE loss
+        aux = sum(criterion(l.reshape(-1, l.shape[-1]), labels) for l in logits_all[:-1])
+        loss = loss + 0.1 * aux / (len(logits_all) - 1)
+        
+        # Confidence regularisation
+        conf_penalty = 0
+        S = len(logits_all)
+        for i, l in enumerate(logits_all):
+            w = (S - i) / S
+            probs = F.softmax(l.reshape(-1, l.shape[-1]), dim=-1)
+            max_p = probs.max(dim=-1).values
+            # Filter out ignore_index (-1)
+            valid = labels != -1
+            if valid.sum() > 0:
+                conf_penalty += w * (1.0 - max_p[valid]).mean()
+                
+        loss = loss + 0.05 * conf_penalty / S
+        
+    return loss
 
 
 def main():
@@ -109,6 +246,62 @@ def main():
     cfg.use_category = False
     cfg.num_categories = 0
 
+    # ── KD teacher (optional) ─────────────────────────────────────────
+    kd_teacher_epochs = int(getattr(cfg, 'kd_teacher_epochs', 0))
+    kd_temp = float(getattr(cfg, 'kd_temp', 4.0))
+    kd_lam  = float(getattr(cfg, 'kd_lam', 0.5))
+    kd_teacher = None
+    teacher_ckpt = os.path.join(cfg.ckpt_dir, "s3dis_teacher.pth")
+
+    if kd_teacher_epochs > 0:
+        kd_teacher = PointNetSegTeacher(NUM_CLASSES, in_channels=in_ch).to(device)
+
+        # If a saved teacher already exists (e.g. resuming after Kaggle timeout),
+        # skip re-training and just load it — saves ~2 hours per resume run.
+        if os.path.exists(teacher_ckpt):
+            print(f"\n[KD] Found saved teacher checkpoint → loading from {teacher_ckpt}")
+            kd_teacher.load_state_dict(
+                torch.load(teacher_ckpt, map_location=device, weights_only=False)
+            )
+            print("[KD] Teacher loaded successfully. Skipping pre-training.")
+        else:
+            print(f"\n[KD] Pre-training PointNet seg teacher ({kd_teacher_epochs} ep, T={kd_temp}, λ={kd_lam})")
+            kd_teacher.train()
+            t_opt = torch.optim.AdamW(kd_teacher.parameters(), lr=1e-3, weight_decay=1e-4)
+            t_sch = torch.optim.lr_scheduler.CosineAnnealingLR(t_opt, T_max=kd_teacher_epochs, eta_min=1e-5)
+            t_criterion = nn.CrossEntropyLoss(weight=class_weights, ignore_index=-1)
+            for t_ep in range(kd_teacher_epochs):
+                t0_ep = time.time()
+                t_loss_sum = t_n = 0
+                n_t_batches = len(train_loader)
+                log_every_t = max(1, n_t_batches // 10)
+                for batch_idx_t, (slices_b, geo_b, pts_feat_b, sid_b, sem_labels_b, cat_b) in enumerate(train_loader):
+                    pts_feat_b   = pts_feat_b.to(device, non_blocking=True)
+                    sem_labels_b = sem_labels_b.to(device, non_blocking=True)
+                    t_logits = kd_teacher(pts_feat_b)
+                    B, N, C = t_logits.shape
+                    t_loss = t_criterion(t_logits.reshape(B*N, C), sem_labels_b.reshape(B*N))
+                    t_opt.zero_grad(); t_loss.backward()
+                    nn.utils.clip_grad_norm_(kd_teacher.parameters(), 1.0)
+                    t_opt.step()
+                    t_loss_sum += float(t_loss.detach()) * B
+                    t_n        += B
+
+                    if (batch_idx_t + 1) % log_every_t == 0 or (batch_idx_t + 1) == n_t_batches:
+                        elapsed_t = time.time() - t0_ep
+                        print(
+                            f"  [Teacher] ep{t_ep+1} [{batch_idx_t+1:4d}/{n_t_batches}] "
+                            f"loss={t_loss.item():.4f} elapsed={elapsed_t:.0f}s",
+                            flush=True,
+                        )
+                t_sch.step()
+                print(f"  [Teacher] Ep {t_ep+1:2d}/{kd_teacher_epochs}  total_loss={t_loss_sum/t_n:.4f} time={time.time()-t0_ep:.0f}s", flush=True)
+            torch.save(kd_teacher.state_dict(), teacher_ckpt)
+            print(f"[KD] Teacher saved → {teacher_ckpt}")
+
+        kd_teacher.eval()
+
+
     model = ASPSegmentor(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {n_params:,}")
@@ -149,11 +342,14 @@ def main():
         best_miou = ckpt.get('best_metric', 0.0)
         print(f"Resumed from epoch {start_epoch}, best mIoU: {best_miou*100:.2f}%")
 
-    # ── Logging ───────────────────────────────────────────────────────
+    # ── Logging — use ONE shared log across all resume runs ───────────
+    # s3dis_train_log.csv accumulates across runs; timestamped runs get their own file too
+    shared_log_path = os.path.join(cfg.log_dir, 's3dis_train_log.csv')
     run_name = f"s3dis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    log_path = os.path.join(cfg.log_dir, f"{run_name}.csv")
-    with open(log_path, 'w') as f:
-        f.write("epoch,train_loss,miou,macc,oa,lr,time\n")
+    log_path = shared_log_path  # always append to the shared log
+    if not os.path.exists(log_path):
+        with open(log_path, 'w') as f:
+            f.write("epoch,train_loss,miou,macc,oa,lr,time\n")
 
     # ── Training loop ─────────────────────────────────────────────────
     for epoch in range(start_epoch, cfg.epochs):
@@ -161,6 +357,10 @@ def main():
 
         tau = max(cfg.tau_end, cfg.tau_start * (cfg.tau_decay ** epoch))
         model.gumbel_tau.fill_(tau)
+
+        # Reset LIF spike statistics for sparsity rate calculation
+        if hasattr(model, 'lif_head') and hasattr(model.lif_head, 'reset_spike_stats'):
+            model.lif_head.reset_spike_stats()
 
         # ── Train ─────────────────────────────────────────────────────
         model.train()
@@ -177,15 +377,27 @@ def main():
             cat_ids = cat_ids.to(device, non_blocking=True)
 
             with autocast(device_type=device.type, enabled=cfg.use_amp):
-                logits, _ = model(
+                logits_final, logits_all = model(
                     slices, geo, sid_arr, cat_ids, pts_feat, training=True
                 )
-                # logits: [B, N, 13]
-                B, N, C = logits.shape
-                loss = criterion(
-                    logits.reshape(B * N, C),
+                # logits_final: [B, N, 13]
+                B, N, C = logits_final.shape
+                
+                loss = active_loss_seg(
+                    logits_final.reshape(B * N, C),
+                    logits_all,
                     sem_labels.reshape(B * N),
+                    criterion
                 )
+
+                if kd_teacher is not None:
+                    with torch.no_grad():
+                        t_logits = kd_teacher(pts_feat)
+                    loss = loss + kd_lam * seg_kd_loss(logits_final, t_logits, kd_temp)
+                
+                # Add spike firing-rate penalty if applicable
+                if hasattr(model, 'lif_head') and hasattr(model.lif_head, 'mean_firing_rate'):
+                    loss = loss + 0.01 * model.lif_head.mean_firing_rate()
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -228,10 +440,10 @@ def main():
                     sid_arr = sid_arr.to(device)
                     cat_ids = cat_ids.to(device)
 
-                    logits, _ = model(
+                    logits_final, _ = model(
                         slices, geo, sid_arr, cat_ids, pts_feat, training=False
                     )
-                    preds = logits.argmax(dim=-1)  # [B, N]
+                    preds = logits_final.argmax(dim=-1)  # [B, N]
                     all_preds.append(preds.cpu().numpy().reshape(-1))
                     all_true.append(sem_labels.numpy().reshape(-1))
 
@@ -295,6 +507,9 @@ def main():
 
     print(f"\nDone. Best mIoU: {best_miou*100:.2f}%")
     print(f"Checkpoint: {cfg.ckpt_dir}/s3dis_best.pt")
+
+    # Plot training curves from shared log
+    plot_training_curves(log_path, cfg.log_dir)
 
 
 if __name__ == "__main__":

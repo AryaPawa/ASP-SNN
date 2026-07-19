@@ -106,7 +106,11 @@ class S3DISDataset(Dataset):
         if split == 'train':
             # Each "sample" is one random block — we define epoch length
             # as total_points // n_points to see each point ~once per epoch
-            self._len = self.total_points // self.n_points
+            epoch_len = getattr(cfg, 'epoch_len', -1)
+            if epoch_len > 0:
+                self._len = epoch_len
+            else:
+                self._len = self.total_points // self.n_points
         else:
             # For testing: pre-compute all block centres for sliding window
             self.test_blocks = self._precompute_test_blocks()
@@ -262,6 +266,30 @@ class S3DISDataset(Dataset):
             # Random room, random block
             room_idx = np.random.randint(0, len(self.rooms))
             block = self._sample_block(self.rooms[room_idx])
+
+            # PointCutMix (Batch/Sample-level Mixup)
+            if getattr(self.cfg, 'aug_cutmix', False) and np.random.random() < getattr(self.cfg, 'aug_cutmix_prob', 0.5):
+                room_idx2 = np.random.randint(0, len(self.rooms))
+                block2 = self._sample_block(self.rooms[room_idx2])
+
+                xyz = block[:, :3]
+                x_min, y_min = xyz[:, 0].min(), xyz[:, 1].min()
+                x_max, y_max = xyz[:, 0].max(), xyz[:, 1].max()
+
+                cx = np.random.uniform(x_min, x_max)
+                cy = np.random.uniform(y_min, y_max)
+                w = np.random.uniform(0.2, 0.5) * (x_max - x_min)
+                h = np.random.uniform(0.2, 0.5) * (y_max - y_min)
+
+                mask = (
+                    (xyz[:, 0] >= cx - w/2) & (xyz[:, 0] < cx + w/2) &
+                    (xyz[:, 1] >= cy - h/2) & (xyz[:, 1] < cy + h/2)
+                )
+
+                num_replace = mask.sum()
+                if num_replace > 0:
+                    replace_idx = np.random.choice(len(block2), num_replace, replace=True)
+                    block[mask] = block2[replace_idx]
         else:
             # Deterministic test block
             room_idx, cx, cy = self.test_blocks[idx]

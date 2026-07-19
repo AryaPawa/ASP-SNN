@@ -235,19 +235,25 @@ def test_checkpoint_roundtrip():
     geo[:, :, 6] = torch.rand(1, cfg.num_slices)
     with torch.no_grad():
         out1 = model(slices, geo, training=False)[-1]
-    with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as f:
-        path = f.name
+    path = "test_ckpt.pt"
     try:
-        torch.save({'model': model.state_dict()}, path)
-        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        with open(path, 'wb') as f:
+            torch.save({'model': model.state_dict()}, f)
+        with open(path, 'rb') as f:
+            ckpt = torch.load(f, map_location='cpu', weights_only=False)
         model2 = ASPClassifier(cfg)
         model2.load_state_dict(ckpt['model'])
         model2.eval()
         with torch.no_grad():
             out2 = model2(slices, geo, training=False)[-1]
     finally:
-        if os.path.exists(path):
-            os.unlink(path)
+        import gc
+        gc.collect()  # force garbage collection to release torch.load file handles on Windows
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except Exception:
+            pass
     assert torch.allclose(out1, out2, atol=1e-5), "Checkpoint round-trip changed predictions"
     print("OK")
 
